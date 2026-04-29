@@ -1,10 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace Microsoft.Diagnostics.Tracing.EventPipe
 {
@@ -12,255 +9,413 @@ namespace Microsoft.Diagnostics.Tracing.EventPipe
 
     internal class EventCache
     {
+        public EventCache(EventPipeEventSource source, ThreadCache threads)
+        {
+            _source = source;
+            _threads = threads;
+        }
+
         public event ParseBufferItemFunction OnEvent;
         public event Action<int> OnEventsDropped;
 
-        public unsafe void ProcessEventBlock(byte[] eventBlockData)
+        public void ProcessEventBlock(Block block)
         {
+            SpanReader reader = block.Reader;
+
             // parse the header
-            if(eventBlockData.Length < 20)
+            ushort headerSize = reader.ReadUInt16();
+            if(headerSize < 20)
             {
-                Debug.Assert(false, "Expected EventBlock of at least 20 bytes");
-                return;
+                throw new FormatException("Invalid EventBlock header size");
             }
-            ushort headerSize = BitConverter.ToUInt16(eventBlockData, 0);
-            if(headerSize < 20 || headerSize > eventBlockData.Length)
-            {
-                Debug.Assert(false, "Invalid EventBlock header size");
-                return;
-            }
-            ushort flags = BitConverter.ToUInt16(eventBlockData, 2);
+            ushort flags = reader.ReadUInt16();
             bool useHeaderCompression = (flags & (ushort)EventBlockFlags.HeaderCompression) != 0;
 
+            // skip the rest of the header
+            reader.ReadBytes(headerSize - 4);
+
             // parse the events
-            PinnedBuffer buffer = new PinnedBuffer(eventBlockData);
-            byte* cursor = (byte*)buffer.PinningHandle.AddrOfPinnedObject();
-            byte* end = cursor + eventBlockData.Length;
-            cursor += headerSize;
-            EventMarker eventMarker = new EventMarker(buffer);
+            EventPipeEventHeader eventHeader = default;
             long timestamp = 0;
-            EventPipeEventHeader.ReadFromFormatV4(cursor, useHeaderCompression, ref eventMarker.Header);
-            if (!_threads.TryGetValue(eventMarker.Header.CaptureThreadId, out EventCacheThread thread))
+            long maxTimestamp = 0;
+            long lastFlushTimestamp = 0;
+            SpanReader tempReader = reader;
+            _source.ReadEventHeader(ref tempReader, useHeaderCompression, ref eventHeader);
+            EventPipeThread thread = _threads.GetOrAddThread(eventHeader.CaptureThreadIndexOrId, eventHeader.SequenceNumber - 1);
+            EventMarker eventMarker = new EventMarker();
+            while (reader.RemainingBytes.Length > 0)
             {
-                thread = new EventCacheThread();
-                thread.SequenceNumber = eventMarker.Header.SequenceNumber - 1;
-                AddThread(eventMarker.Header.CaptureThreadId, thread);
-            }
-            eventMarker = new EventMarker(buffer);
-            while (cursor < end)
-            {
-                EventPipeEventHeader.ReadFromFormatV4(cursor, useHeaderCompression, ref eventMarker.Header);
+                _source.ReadEventHeader(ref reader, useHeaderCompression, ref eventMarker.Header);
                 bool isSortedEvent = eventMarker.Header.IsSorted;
-                timestamp = eventMarker.Header.TimeStamp;
+                thread.LastCachedEventTimestamp = timestamp = eventMarker.Header.TimeStamp;
+                maxTimestamp = Math.Max(maxTimestamp, timestamp);
                 int sequenceNumber = eventMarker.Header.SequenceNumber;
                 if (isSortedEvent)
                 {
-                    thread.LastCachedEventTimestamp = timestamp;
-
                     // sorted events are the only time the captureThreadId should change
-                    long captureThreadId = eventMarker.Header.CaptureThreadId;
-                    if (!_threads.TryGetValue(captureThreadId, out thread))
-                    {
-                        thread = new EventCacheThread();
-                        thread.SequenceNumber = sequenceNumber - 1;
-                        AddThread(captureThreadId, thread);
-                    }
+                    long captureThreadId = eventMarker.Header.CaptureThreadIndexOrId;
+                    thread = _threads.GetOrAddThread(captureThreadId, sequenceNumber - 1);
                 }
-
-                int droppedEvents = (int)Math.Min(int.MaxValue, sequenceNumber - thread.SequenceNumber - 1);
-                if(droppedEvents > 0)
-                {
-                    OnEventsDropped?.Invoke(droppedEvents);
-                }
-                else
-                {
-                    // When a thread id is recycled the sequenceNumber can abruptly reset to 1 which
-                    // makes droppedEvents go negative
-                    Debug.Assert(droppedEvents == 0 || sequenceNumber == 1);
-                }
+                NotifyDroppedEventsIfNeeded(thread.SequenceNumber, sequenceNumber - 1);
                 thread.SequenceNumber = sequenceNumber;
 
                 if(isSortedEvent)
                 {
+                    lastFlushTimestamp = timestamp;
                     SortAndDispatch(timestamp);
                     OnEvent?.Invoke(ref eventMarker.Header);
                 }
                 else
                 {
+                    if (thread.Events.Count == 0)
+                    {
+                        _activeThreadQueues.Add(thread.Events);
+                    }
                     thread.Events.Enqueue(eventMarker);
-
                 }
 
-                cursor += eventMarker.Header.TotalNonHeaderSize + eventMarker.Header.HeaderSize;
+                reader.ReadBytes(eventMarker.Header.PayloadSize);
                 EventMarker lastEvent = eventMarker;
-                eventMarker = new EventMarker(buffer);
+                eventMarker = new EventMarker();
                 eventMarker.Header = lastEvent.Header;
             }
-            thread.LastCachedEventTimestamp = timestamp;
+
+            // We need to keep the buffer around until all events are processed
+            EventBlockBuffer buffer = new EventBlockBuffer(block.TakeOwnership(), maxTimestamp);
+            _buffers.Enqueue(buffer);
+
+            // get rid of old buffers if all their events are older than an event we already flushed
+            FreeOldEventBuffers(lastFlushTimestamp);
         }
 
-        public unsafe void ProcessSequencePointBlock(byte[] sequencePointBytes)
+        public void ProcessSequencePointBlockV5OrLess(Block block)
         {
-            const int SizeOfTimestampAndThreadCount = 12;
-            const int SizeOfThreadIdAndSequenceNumber = 12;
-            if(sequencePointBytes.Length < SizeOfTimestampAndThreadCount)
+            SpanReader reader = block.Reader;
+            long timestamp = (long)reader.ReadUInt64();
+            int threadCount = (int)reader.ReadUInt32();
+            Flush();
+            TrimEventsAfterSequencePoint();
+            for (int i = 0; i < threadCount; i++)
             {
-                Debug.Assert(false, "Bad sequence point block length");
-                return;
+                long captureThreadId = (long)reader.ReadUInt64();
+                int sequenceNumber = (int)reader.ReadUInt32();
+                CheckpointThread(captureThreadId, sequenceNumber);
             }
-            long timestamp = BitConverter.ToInt64(sequencePointBytes, 0);
-            int threadCount = BitConverter.ToInt32(sequencePointBytes, 8);
-            if(sequencePointBytes.Length < SizeOfTimestampAndThreadCount + threadCount*SizeOfThreadIdAndSequenceNumber)
+        }
+
+        enum SequencePointFlags : uint
+        {
+            FlushThreads = 1,
+            FlushMetadata = 2
+        }
+
+        public void ProcessSequencePointBlockV6OrGreater(Block block)
+        {
+            SpanReader reader = block.Reader;
+            long timestamp = (long)reader.ReadUInt64();
+            uint flags = reader.ReadUInt32();
+            int threadCount = (int)reader.ReadUInt32();
+            Flush();
+            TrimEventsAfterSequencePoint();
+            for (int i = 0; i < threadCount; i++)
             {
-                Debug.Assert(false, "Bad sequence point block length");
-                return;
+                long captureThreadIndex = (long)reader.ReadVarUInt64();
+                int sequenceNumber = (int)reader.ReadVarUInt32();
+                CheckpointThread(captureThreadIndex, sequenceNumber);
             }
-            SortAndDispatch(timestamp);
-            foreach(EventCacheThread thread in _threads.Values)
+
+            if((flags & (uint)SequencePointFlags.FlushThreads) != 0)
+            {
+                _threads.Flush();
+            }
+
+            if((flags & (uint)SequencePointFlags.FlushMetadata) != 0)
+            {
+                _source.FlushMetadataCache();
+            }
+        }
+
+        /// <summary>
+        /// Flush all remaining events, free all buffers, and remove any threads that are pending removal.
+        /// </summary>
+        public void Flush()
+        {
+            SortAndDispatch(long.MaxValue);
+            FreeOldEventBuffers(long.MaxValue);
+            CheckForPendingThreadRemoval();
+        }
+
+        private void TrimEventsAfterSequencePoint()
+        {
+            foreach (EventPipeThread thread in _threads.Values)
             {
                 Debug.Assert(thread.Events.Count == 0, "There shouldn't be any pending events after a sequence point");
                 thread.Events.Clear();
                 thread.Events.TrimExcess();
             }
-
-            int cursor = SizeOfTimestampAndThreadCount;
-            for(int i = 0; i < threadCount; i++)
-            {
-                long captureThreadId = BitConverter.ToInt64(sequencePointBytes, cursor);
-                int sequenceNumber = BitConverter.ToInt32(sequencePointBytes, cursor + 8);
-                if (!_threads.TryGetValue(captureThreadId, out EventCacheThread thread))
-                {
-                    if(sequenceNumber > 0)
-                    {
-                        OnEventsDropped?.Invoke(sequenceNumber);
-                    }
-                    thread = new EventCacheThread();
-                    thread.SequenceNumber = sequenceNumber;
-                    AddThread(captureThreadId, thread);
-                }
-                else
-                {
-                    int droppedEvents = unchecked(sequenceNumber - thread.SequenceNumber);
-                    if (droppedEvents > 0)
-                    {
-                        OnEventsDropped?.Invoke(droppedEvents);
-                    }
-                    else
-                    {
-                        // When a thread id is recycled the sequenceNumber can abruptly reset to 1 which
-                        // makes droppedEvents go negative
-                        Debug.Assert(droppedEvents == 0 || sequenceNumber == 1);
-                    }
-                    thread.SequenceNumber = sequenceNumber;
-                }
-                cursor += SizeOfThreadIdAndSequenceNumber;
-            }
         }
 
-        /// <summary>
-        /// After all events have been parsed we could have some straglers that weren't
-        /// earlier than any sorted event. Sort and dispatch those now.
-        /// </summary>
-        public void Flush()
+        private void CheckForPendingThreadRemoval()
         {
-            SortAndDispatch(long.MaxValue);
+            foreach (var thread in _threads.Values)
+            {
+                if (thread.RemovalPending && thread.Events.Count == 0)
+                {
+                    _threads.RemoveThread(thread.ThreadId);
+                }
+            }
         }
 
         private unsafe void SortAndDispatch(long stopTimestamp)
         {
-            // This sort could be made faster by using a min-heap but this is a simple place to start
-            List<Queue<EventMarker>> threadQueues = new List<Queue<EventMarker>>(_threads.Values.Select(t => t.Events));
-            while(true)
+            // Build a min-heap from active thread queues (those with pending events) whose
+            // front event is before stopTimestamp. Using _activeThreadQueues avoids iterating
+            // all threads in the dictionary — only threads that have had events enqueued are checked.
+            // This gives O(N * log(T)) merge performance where N is the number of events and
+            // T is the number of active threads.
+            _heap.Clear();
+            foreach (Queue<EventMarker> q in _activeThreadQueues)
             {
-                long lowestTimestamp = stopTimestamp;
-                Queue<EventMarker> oldestEventQueue = null;
-                foreach(Queue<EventMarker> threadQueue in threadQueues)
+                if (q.Count > 0)
                 {
-                    if(threadQueue.Count == 0)
+                    long ts = q.Peek().Header.TimeStamp;
+                    if (ts < stopTimestamp)
                     {
-                        continue;
-                    }
-                    long eventTimestamp = threadQueue.Peek().Header.TimeStamp;
-                    if (eventTimestamp < lowestTimestamp)
-                    {
-                        oldestEventQueue = threadQueue;
-                        lowestTimestamp = eventTimestamp;
+                        _heap.Add(ts, q);
                     }
                 }
-                if(oldestEventQueue == null)
+            }
+
+            if (_heap.Count == 0)
+            {
+                return;
+            }
+
+            _heap.Build();
+
+            // Merge events in timestamp order using the min-heap.
+            while (_heap.Count > 0)
+            {
+                Queue<EventMarker> minQueue = _heap.PeekValue;
+                EventMarker eventMarker = minQueue.Dequeue();
+                OnEvent?.Invoke(ref eventMarker.Header);
+
+                if (minQueue.Count > 0)
                 {
-                    break;
+                    long nextTs = minQueue.Peek().Header.TimeStamp;
+                    if (nextTs < stopTimestamp)
+                    {
+                        // Update the root with the next timestamp and restore the heap property.
+                        _heap.ReplaceRoot(nextTs, minQueue);
+                    }
+                    else
+                    {
+                        _heap.RemoveRoot();
+                    }
                 }
                 else
                 {
-                    EventMarker eventMarker = oldestEventQueue.Dequeue();
-                    OnEvent?.Invoke(ref eventMarker.Header);
-                    GC.KeepAlive(eventMarker);
-                }
-            }
-
-            // If the app creates and destroys threads over time we need to flush old threads
-            // from the cache or memory usage will grow unbounded. AddThread handles the
-            // the thread objects but the storage for the queue elements also does not shrink
-            // below the high water mark unless we free it explicitly.
-            foreach(Queue<EventMarker> q in threadQueues)
-            {
-                if(q.Count == 0)
-                {
-                    q.TrimExcess();
+                    _heap.RemoveRoot();
+                    // Remove from active set and free internal storage to prevent unbounded
+                    // memory growth when the application creates and destroys threads.
+                    _activeThreadQueues.Remove(minQueue);
+                    minQueue.TrimExcess();
                 }
             }
         }
 
-        private void AddThread(long captureThreadId, EventCacheThread thread)
+        #region Min-heap Implementation
+
+        /// <summary>
+        /// A min-heap that pairs a long key with a value of type <typeparamref name="TValue"/>.
+        /// Entries are ordered by key so the minimum key is always at the root.
+        /// </summary>
+        internal class MinHeap<TValue>
         {
-            // To ensure we don't have unbounded growth we evict old threads to make room
-            // for new ones. Evicted threads can always be re-added later if they log again
-            // but there are two consequences:
-            // a) We won't detect lost events on that thread after eviction
-            // b) If the thread still had events pending dispatch they will be lost
-            // We pick the thread that has gone the longest since it last logged an event
-            // under the presumption that it is probably dead, has no events, and won't
-            // log again.
-            //
-            // In the future if we had explicit thread death notification events we could keep
-            // this cache leaner.
-            if(_threads.Count >= 5000)
+            private struct Entry
             {
-                long oldestThreadCaptureId = -1;
-                long smallestTimestamp = long.MaxValue;
-                foreach(var kv in _threads)
+                public long Key;
+                public TValue Value;
+
+                public Entry(long key, TValue value)
                 {
-                    if(kv.Value.LastCachedEventTimestamp < smallestTimestamp)
-                    {
-                        smallestTimestamp = kv.Value.LastCachedEventTimestamp;
-                        oldestThreadCaptureId = kv.Key;
-                    }
+                    Key = key;
+                    Value = value;
                 }
-                Debug.Assert(oldestThreadCaptureId != -1);
-                _threads.Remove(oldestThreadCaptureId);
             }
-            _threads[captureThreadId] = thread;
+
+            private readonly List<Entry> _entries = new List<Entry>();
+
+            public int Count => _entries.Count;
+
+            public TValue PeekValue => _entries[0].Value;
+
+            public void Clear() => _entries.Clear();
+
+            public void Add(long key, TValue value)
+            {
+                _entries.Add(new Entry(key, value));
+            }
+
+            /// <summary>
+            /// Establishes the heap property over all entries. Call once after adding all
+            /// entries via Add, before extracting from the heap.
+            /// </summary>
+            /// <remarks>
+            /// Starts from the last non-leaf node (_entries.Count / 2 - 1) and sifts each
+            /// node down to its correct position. Leaves (the second half of the array) are
+            /// already trivially valid heaps of size 1, so they are skipped.
+            /// </remarks>
+            public void Build()
+            {
+                // Start from the last non-leaf node and work backwards to the root.
+                // Nodes at indices [Count/2 .. Count-1] are leaves that need no adjustment.
+                for (int i = _entries.Count / 2 - 1; i >= 0; i--)
+                {
+                    SiftDown(i);
+                }
+            }
+
+            /// <summary>
+            /// Replaces the root entry with a new key/value pair and restores the heap property.
+            /// Use when the root element has been consumed but its source still has more items.
+            /// </summary>
+            public void ReplaceRoot(long newKey, TValue value)
+            {
+                _entries[0] = new Entry(newKey, value);
+                SiftDown(0);
+            }
+
+            /// <summary>
+            /// Removes the root (minimum) entry from the heap and restores the heap property.
+            /// </summary>
+            public void RemoveRoot()
+            {
+                int lastIndex = _entries.Count - 1;
+                if (lastIndex == 0)
+                {
+                    _entries.Clear();
+                }
+                else
+                {
+                    _entries[0] = _entries[lastIndex];
+                    _entries.RemoveAt(lastIndex);
+                    SiftDown(0);
+                }
+            }
+
+            /// <summary>
+            /// Restores the min-heap property by moving the element at index i down the tree
+            /// until it is smaller than both children or reaches a leaf position.
+            /// </summary>
+            private void SiftDown(int i)
+            {
+                int count = _entries.Count;
+                while (true)
+                {
+                    int smallest = i;
+
+                    // In a binary heap stored as an array, the children of node i are at
+                    // indices 2i+1 (left) and 2i+2 (right).
+                    int left = 2 * i + 1;
+                    int right = 2 * i + 2;
+
+                    if (left < count && _entries[left].Key < _entries[smallest].Key)
+                    {
+                        smallest = left;
+                    }
+                    if (right < count && _entries[right].Key < _entries[smallest].Key)
+                    {
+                        smallest = right;
+                    }
+                    if (smallest == i)
+                    {
+                        break;
+                    }
+                    (_entries[i], _entries[smallest]) = (_entries[smallest], _entries[i]);
+                    i = smallest;
+                }
+            }
         }
 
-        Dictionary<long, EventCacheThread> _threads = new Dictionary<long, EventCacheThread>();
-    }
+        #endregion
 
-    internal class EventCacheThread
-    {
-        public Queue<EventMarker> Events = new Queue<EventMarker>();
-        public int SequenceNumber;
-        public long LastCachedEventTimestamp;
+        private void FreeOldEventBuffers(long stopTimestamp)
+        {
+            while (_buffers.Count > 0)
+            {
+                EventBlockBuffer blockBuffer = _buffers.Peek();
+                if (blockBuffer.MaxEventTimestamp < stopTimestamp)
+                {
+                    _buffers.Dequeue();
+                    ((IDisposable)blockBuffer.Buffer).Dispose();
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+
+        public void CheckpointThreadAndPendRemoval(long threadIndex, int sequenceNumber)
+        {
+            EventPipeThread thread = _threads.GetThread(threadIndex);
+            CheckpointThread(thread, sequenceNumber);
+            thread.RemovalPending = true;
+        }
+
+        public void CheckpointThread(long threadIndex, int sequenceNumber)
+        {
+            EventPipeThread thread = _threads.GetOrAddThread(threadIndex, sequenceNumber);
+            CheckpointThread(thread, sequenceNumber);
+        }
+
+        private void CheckpointThread(EventPipeThread thread, int sequenceNumber)
+        {
+            NotifyDroppedEventsIfNeeded(thread.SequenceNumber, sequenceNumber);
+            thread.SequenceNumber = sequenceNumber;
+        }
+
+        private void NotifyDroppedEventsIfNeeded(int sequenceNumber, int expectedSequenceNumber)
+        {
+            // Either events were dropped or the sequence number was reset because the thread ID was recycled.
+            // V6 format never recycles thread indexes but prior formats do. We assume heuristically that if an event or sequence
+            // point implies the last sequenceNumber was zero then the thread was recycled.
+            if (_source.FileFormatVersionNumber >= 6 || sequenceNumber != 0)
+            {
+                int droppedEvents = unchecked(expectedSequenceNumber - sequenceNumber);
+                if (droppedEvents < 0)
+                {
+                    droppedEvents = int.MaxValue;
+                }
+                if (droppedEvents > 0)
+                {
+                    OnEventsDropped?.Invoke(droppedEvents);
+                }
+            }
+        }
+
+        struct EventBlockBuffer
+        {
+            public EventBlockBuffer(FixedBuffer buffer, long maxTimestamp)
+            {
+                Buffer = buffer;
+                MaxEventTimestamp = maxTimestamp;
+            }
+            public FixedBuffer Buffer;
+            public long MaxEventTimestamp;
+        }
+
+        EventPipeEventSource _source;
+        ThreadCache _threads;
+        Queue<EventBlockBuffer> _buffers = new Queue<EventBlockBuffer>();
+        MinHeap<Queue<EventMarker>> _heap = new MinHeap<Queue<EventMarker>>();
+        HashSet<Queue<EventMarker>> _activeThreadQueues = new HashSet<Queue<EventMarker>>();
     }
 
     internal class EventMarker
     {
-        public EventMarker(PinnedBuffer buffer)
-        {
-            Buffer = buffer;
-        }
         public EventPipeEventHeader Header;
-        public PinnedBuffer Buffer;
     }
 
     internal class PinnedBuffer

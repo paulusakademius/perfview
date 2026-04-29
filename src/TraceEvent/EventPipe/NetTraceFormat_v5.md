@@ -221,6 +221,8 @@ Compressed events are encoded with a header:
  - if Flags & 2 the value is read from the stream + previous SequenceNumber
  - otherwise previous sequence number
  - in either case, if MetadataId != 0 increment SequenceNumber by 1
+ - Note: For metadata events (MetadataId = 0), the sequence number, capture thread id, and capture proc number are always 0
+ - Note: Metadata events never have the CaptureThreadAndSequence flag set (Flags & 2 is always 0 for metadata events)
 - CaptureThreadId optional varint64
   - if Flags & 2 the value is read from the stream
   - otherwise previous CaptureThreadId
@@ -288,14 +290,16 @@ If TagKind=V2Params the payload consists of
 
 Followed by V2FieldCount number of field definitions
 
-    int V2TypeCode;      // In V2 this can be EventPipeTypeCodeArray==19
-    int ArrayTypeCode;   // This optional field only appears when V2TypeCode==EventPipeTypeCodeArray
+    int Size                    // the number of bytes used to encode the field, inclusive of the 4 bytes in this Size field
+    string FieldName            // The 2 byte Unicode, null terminated string representing the Name of the Field
+    int V2TypeCode;             // In V2 EventPipeTypeCodeArray=19 is also permitted, in addition to all typecodes allowed in V1
+    int ArrayElementTypeCode;   // This optional field only appears when V2TypeCode==EventPipeTypeCodeArray
     <PAYLOAD_DESCRIPTION>
-    string FieldName
+    optional padding            // as many padding bytes as needed so that the total size of the field definition = Size
 
 If the metadata event specifies a V2Params tag, the event must have an empty V1 parameter FieldCount and no field definitions.
 
-For primitive types and strings <PAYLOAD_DESCRIPTION> is not present, however if TypeCode == Object (1) then <PAYLOAD_DESCRIPTION> another payload
+For primitive types and strings <PAYLOAD_DESCRIPTION> is not present, however if TypeCode == Object (1) then <PAYLOAD_DESCRIPTION> is another payload
 description (that is a field count, followed by a list of field definitions).   These can be nested to arbitrary depth.  
 
 No attempt is made to be sophisticated about serializing the payload fields for event blobs in an EventBlock.   Each primitive type is serialized in little endian format.  Strings 

@@ -1,4 +1,4 @@
-using Diagnostics.Tracing.StackSources;
+﻿using Diagnostics.Tracing.StackSources;
 using global::DiagnosticsHub.Packaging.Interop;
 using Graphs;
 using Microsoft.Diagnostics.Symbols;
@@ -7,6 +7,7 @@ using Microsoft.Diagnostics.Tracing.AutomatedAnalysis;
 using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Tracing.EventPipe;
 using Microsoft.Diagnostics.Tracing.Parsers;
+using Microsoft.Diagnostics.Tracing.Parsers.Universal.Events;
 using Microsoft.Diagnostics.Tracing.Parsers.AspNet;
 using Microsoft.Diagnostics.Tracing.Parsers.Clr;
 using Microsoft.Diagnostics.Tracing.Parsers.ClrPrivate;
@@ -42,6 +43,7 @@ using Microsoft.Diagnostics.Tracing.Parsers.Tpl;
 using Utilities;
 using Address = System.UInt64;
 using EventSource = EventSources.EventSource;
+using PerfView.Dialogs;
 
 namespace PerfView
 {
@@ -742,6 +744,11 @@ namespace PerfView
             };
         }
 
+        /// <summary>
+        /// Called when a stack window is launched but after the processes have been selected.
+        /// </summary>
+        protected internal virtual void OnStackWindowLaunch(Window parentWindow, List<int> processIDs, string sourceName) { }
+
         protected internal virtual void ConfigureStackWindow(string stackSourceName, StackWindow stackWindow) { }
         /// <summary>
         /// Allows you to do a first action after everything is done.  
@@ -1203,55 +1210,84 @@ namespace PerfView
 
         private string GenerateReportFile(StatusBar worker, TraceLog trace)
         {
-            var reportFileName = CacheFiles.FindFile(FilePath, "." + Name + ".html");
-            using (var writer = File.CreateText(reportFileName))
-            {
-                writer.WriteLine("<html>");
-                writer.WriteLine("<head>");
-                writer.WriteLine("<title>{0}</title>", Title);
-                writer.WriteLine("<meta charset=\"UTF-8\"/>");
-                writer.WriteLine("<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\"/>");
+            var reportFileName = CacheFiles.FindFile(FilePath, $".{Name}.html");
+            using var writer = File.CreateText(reportFileName);
+            writer.WriteLine($$"""
+                <html lang="en">
+                  <head>
+                    <title>{{Title}}</title>
+                    <meta charset="UTF-8"/>
+                    <meta name="color-scheme" content="light dark">
+                    <style>
+                      :root[data-theme="light"] {
+                        color-scheme: light;
+                        --error-color: #b3261e;       /* dark red for light mode (accessible on white) */
+                        --hover-color: #eeeeee;       /* light grey for hover on light bg */
+                        --row-vibrant-blue: #56a5eC;
+                        --row-medium-blue: #82caff;
+                        --row-subtle-blue: #bdedff;
+                      }
 
-                // Add basic styling to the generated HTML
-                writer.WriteLine(@"
-<style>
-body {
-    font-family: Segoe UI Light, Helvetica, sans-serif;
-}
+                      :root[data-theme="dark"] {
+                        color-scheme: dark;
+                        --error-color: #ffb4ab;      /* soft red/pink for dark mode (better on dark) */
+                        --hover-color: #333333;      /* dark grey for hover on dark bg */
+                        --row-vibrant-blue: #234d7a;
+                        --row-medium-blue: #1e4166;
+                        --row-subtle-blue: #1a3552;
+                      }
 
-tr:hover {
-    background-color: #eeeeee;
-}
+                      body {
+                        font-family: Segoe UI Light, Helvetica, sans-serif;
+                      }
 
-th {
-    background-color: #eeeeee;
-    font-family: Helvetica;
-    padding: 4px;
-    font-size: small;
-    font-weight: normal;
-}
+                      tr:hover {
+                        background-color: var(--hover-color);
+                      }
 
-td {
-    font-family: Consolas, monospace;
-    font-size: small;
-    padding: 3px;
-    padding-bottom: 5px;
-}
+                      th {
+                        background-color: var(--hover-color);
+                        font-family: Helvetica;
+                        padding: 4px;
+                        font-size: small;
+                        font-weight: normal;
+                      }
 
-table {
-    border-collapse: collapse;
-}
-</style>
-");
+                      td {
+                        font-family: Consolas, monospace;
+                        font-size: small;
+                        padding: 3px;
+                        padding-bottom: 5px;
+                      }
 
-                writer.WriteLine("</head>");
-                writer.WriteLine("<body>");
-                WriteHtmlBody(trace, writer, reportFileName, worker.LogWriter);
-                writer.WriteLine("</body>");
-                writer.WriteLine("</html>");
+                      table {
+                        border-collapse: collapse;
+                      }
 
+                      .error {
+                        color: var(--error-color);
+                        font-weight: bold;
+                        font-size: medium;
+                      }
 
-            }
+                      .row-vibrant { background-color: var(--row-vibrant-blue); }
+                      .row-medium { background-color: var(--row-medium-blue); }
+                      .row-subtle { background-color: var(--row-subtle-blue); }
+                    </style>
+                  </head>
+                  <body>
+                """);
+
+            WriteHtmlBody(trace, writer, reportFileName, worker.LogWriter);
+            writer.WriteLine("""
+                    <script>
+                      // Set theme based on user preference
+                      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                      document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+                    </script>
+                  </body>
+                </html>
+                """);
 
             return reportFileName;
         }
@@ -4615,6 +4651,9 @@ table {
                                 SetProcessFilter(incPat);
                             }
 
+                            // Call the launch hook to perform any initialization needed after process selection
+                            DataFile.OnStackWindowLaunch(parentWindow, processIDs, SourceName);
+
                             Viewer.StatusBar.StartWork("Looking up high importance PDBs that are locally cached", delegate
                             {
                                 // TODO This is probably a hack that it is here.  
@@ -4640,13 +4679,16 @@ table {
                                     // Catch the error if you don't merge and move to a new machine.  
                                     if (traceLog != null && !traceLog.CurrentMachineIsCollectionMachine() && !traceLog.HasPdbInfo)
                                     {
-                                        MessageBox.Show(parentWindow,
-                                            "Warning!   This file was not merged and was moved from the collection\r\n" +
-                                            "machine.  This means the data is incomplete and symbolic name resolution\r\n" +
-                                            "will NOT work.  The recommended fix is use the perfview (not windows OS)\r\n" +
-                                            "zip command.  Right click on the file in the main view and select ZIP.\r\n" +
-                                            "\r\n" +
-                                            "See merging and zipping in the users guide for more information.",
+                                        XamlMessageBox.Show(
+                                            parentWindow,
+                                            """
+                                            Warning! This file was not merged and was moved from the collection
+                                            machine. This means the data is incomplete and symbolic name resolution
+                                            will NOT work. The recommended fix is use the perfview (not windows OS)
+                                            zip command. Right click on the file in the main view and select ZIP.
+
+                                            See merging and zipping in the users guide for more information.
+                                            """,
                                             "Data not merged before leaving the machine!");
                                     }
 
@@ -4708,6 +4750,7 @@ table {
         {
             DataFile.FirstAction(stackWindow);
         }
+
         public override ImageSource Icon { get { return GuiApp.MainWindow.Resources["StackSourceBitmapImage"] as ImageSource; } }
 
         // If set, we don't show the process selection dialog.  
@@ -4724,6 +4767,14 @@ table {
             if (!m_WarnedAboutBrokenStacks)
             {
                 m_WarnedAboutBrokenStacks = true;
+                
+                // Only run broken stack analysis for ETW traces, as the logic is specific to ETW.
+                // Universal traces, EventPipe traces, Linux traces, etc. should not use this analysis.
+                if (!(DataFile is ETLPerfViewData))
+                {
+                    return false;
+                }
+                
                 float brokenPercent = Viewer.CallTree.Root.GetBrokenStackCount() * 100 / Viewer.CallTree.Root.InclusiveCount;
                 if (brokenPercent > 0)
                 {
@@ -4745,14 +4796,19 @@ table {
         {
             if (brokenPercent > 1)
             {
-                log.WriteLine("Finished aggregating stacks.  (" + brokenPercent.ToString("f1") + "% Broken Stacks)");
+                log.WriteLine($"Finished aggregating stacks.  ({brokenPercent:f1}% Broken Stacks)");
             }
 
             if (brokenPercent > 10)
             {
-                MessageBox.Show(parentWindow, "Warning: There are " + brokenPercent.ToString("f1") + "% stacks that are broken\r\n" +
-                    "Top down analysis is suspect, however bottom up approaches are still valid.\r\n\r\n" +
-                    "Use the troubleshooting link at the top of the view for more information.\r\n",
+                XamlMessageBox.Show(
+                    parentWindow,
+                    $"""
+                    Warning: There are {brokenPercent:f1}% stacks that are broken.
+                    Top down analysis is suspect, however bottom up approaches are still valid.
+
+                    Use the troubleshooting link at the top of the view for more information.
+                    """,
                     "Broken Stacks");
 
                 return true;
@@ -5556,12 +5612,15 @@ table {
             {
                 // TODO FIX NOW, investigate the missing events.  All we know is that incs and dec are not
                 // consistent with the RefCount value that is in the events.
-                GuiApp.MainWindow.Dispatcher.BeginInvoke((Action)delegate ()
+                GuiApp.MainWindow.Dispatcher.BeginInvoke(() =>
                 {
-                    MessageBox.Show(GuiApp.MainWindow,
-                        "Warning: the Interop CCW events on which this data is based seem to be incomplete.\r\n" +
-                        "There seem to be missing instrumentation, which make the referenct counts unreliable\r\n"
-                        , "Data May be Incorrect");
+                    MessageBox.Show(
+                        GuiApp.MainWindow,
+                        """
+                        Warning: the Interop CCW events on which this data is based seem to be incomplete.
+                        There seem to be missing instrumentation, which make the referenct counts unreliable
+                        """,
+                        "Data May be Incorrect");
                 });
 
                 var objectToTypeMap = new Dictionary<long, Address>(1000);
@@ -6017,7 +6076,7 @@ table {
                                     {
                                         const int numBuckets = 20;
                                         int bucket = (int)(normalizeDistance * numBuckets);
-                                        int bucketSizeInPages = module.ModuleFile.ImageSize / (numBuckets * 4096);
+                                        int bucketSizeInPages = (int)(module.ModuleFile.ImageSize / (numBuckets * 4096));
                                         string bucketName = "Image Bucket " + bucket + " Size " + bucketSizeInPages + " Pages";
                                         stackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(bucketName), stackIndex);
                                     }
@@ -6554,7 +6613,7 @@ table {
 
                 // These three variables are used in the local function GetAllocationType defined below.
                 // and are used to look up type names associated with the native allocations.   
-                var loadedModules = new Dictionary<TraceModuleFile, NativeSymbolModule>();
+                var loadedModules = new Dictionary<TraceModuleFile, string>(); // Cache PDB paths, not NativeSymbolModule objects
                 var allocationTypeNames = new Dictionary<CallStackIndex, string>();
                 var symReader = GetSymbolReader(log, SymbolReaderOptions.CacheOnly);
 
@@ -6620,15 +6679,19 @@ table {
                                 if (module == null)
                                     continue;
 
-                                if (!loadedModules.TryGetValue(module, out var symbolModule))
+                                // Get the PDB path from cache or find it.
+                                // Cache the path instead of the NativeSymbolModule object because the SymbolReader
+                                // will dispose of the NativeSymbolModule when it is evicated from the SymbolReader cache.
+                                if (!loadedModules.TryGetValue(module, out var pdbPath))
                                 {
-                                    loadedModules[module] = symbolModule =
-                                        (module.PdbSignature != Guid.Empty
-                                            ? symReader.FindSymbolFilePath(module.PdbName, module.PdbSignature, module.PdbAge, module.FilePath)
-                                            : symReader.FindSymbolFilePathForModule(module.FilePath)) is string pdb
-                                        ? symReader.OpenNativeSymbolFile(pdb)
-                                        : null;
+                                    pdbPath = (module.PdbSignature != Guid.Empty
+                                        ? symReader.FindSymbolFilePath(module.PdbName, module.PdbSignature, module.PdbAge, module.FilePath)
+                                        : symReader.FindSymbolFilePathForModule(module.FilePath));
+                                    loadedModules[module] = pdbPath; // Cache the path, not the module
                                 }
+
+                                // Load the symbol file, using the SymbolReader cache or going to the disk if necessary.
+                                var symbolModule = (pdbPath != null) ? symReader.OpenNativeSymbolFile(pdbPath) : null;
 
                                 typeName = symbolModule?.GetTypeForHeapAllocationSite(
                                         (uint)(eventLog.CodeAddresses.Address(eventLog.CallStacks.CodeAddressIndex(current)) - module.ImageBase)
@@ -6806,6 +6869,83 @@ table {
         }
 
         #region private
+
+        /// <summary>
+        /// Checks if RuntimeStart events exist for the selected processes and warns if missing.
+        /// This indicates whether the processes were started after tracing began, which is required
+        /// for proper type information in unsampled allocation traces.
+        /// </summary>
+        private void WarnAboutMissingTypeInfoForProcesses(Window parentWindow, List<int> processIDs, string sourceName)
+        {
+            bool showWarning = true;
+
+            // Only check for allocation-related views
+            if (!sourceName.Equals("GC Heap Alloc Ignore Free") &&
+                !sourceName.Equals("GC Heap Net Mem") &&
+                !sourceName.Equals("Gen 2 Object Deaths"))
+            {
+                return;
+            }
+
+            TraceLog traceLog = TryGetTraceLog();
+            if (traceLog == null)
+            {
+                return;
+            }
+
+            // Check if we have RuntimeStart events for the selected processes
+            HashSet<int> selectedProcessesWithRuntimeStartEvents = new HashSet<int>();
+
+            if (processIDs != null && processIDs.Count > 0)
+            {
+                using TraceLogEventSource source = traceLog.Events.GetSource();
+
+                source.Clr.RuntimeStart += delegate (RuntimeInformationTraceData data)
+                {
+                    if (processIDs.Contains(data.ProcessID))
+                    {
+                        selectedProcessesWithRuntimeStartEvents.Add(data.ProcessID);
+                    }
+                };
+
+                source.Process();
+
+                showWarning = processIDs.Count != selectedProcessesWithRuntimeStartEvents.Count;
+            }
+            else
+            {
+                // If no specific processes selected, check if any RuntimeStart exists
+                foreach (var stats in traceLog.Stats)
+                {
+                    if (stats.ProviderGuid == ClrTraceEventParser.ProviderGuid && stats.EventName == "Runtime/Start")
+                    {
+                        showWarning = false;
+                        break;
+                    }
+                }
+            }
+
+            // Show warning if RuntimeStart not found for selected processes
+            if (showWarning)
+            {
+                var warning = $"""
+                    WARNING: The '{sourceName}' view may be missing type information.
+
+                    This can happen when the ETW circular buffer wraps and loses early events including type definitions. Without these type definitions, many types will appear as "UNKNOWN" in the allocation view.
+
+                    To fix this issue, perform one of the following:
+                      • Re-capture the trace with a shorter duration
+                      • Re-capture the trace with a larger circular buffer size (e.g., /BufferSize:1024)
+                    """;
+
+                XamlMessageBox.Show(
+                    parentWindow,
+                    warning,
+                    "Trace May Be Missing Type Information",
+                    MessageBoxButton.OK);
+            }
+        }
+
         private static StackSource GetProcessFileRegistryStackSource(TraceLogEventSource eventSource, TextWriter log)
         {
             TraceLog traceLog = eventSource.TraceLog;
@@ -7532,17 +7672,26 @@ table {
             {
                 if (App.UserConfigData["WarnedAboutOsHeapAllocTypes"] == null)
                 {
-                    MessageBox.Show(stackWindow,
-                        "Warning: Allocation type resolution only happens on window launch.\r\n" +
-                        "Thus if you manually lookup symbols in this view you will get method\r\n" +
-                        "names of allocations sites, but to get the type name associated the \r\n" +
-                        "allocation site.\r\n" +
-                        "\r\n" +
-                        "You must close and reopen this window to get the allocation types.\r\n"
-                        , "May need to resolve PDBs and reopen.");
+                    XamlMessageBox.Show(
+                        stackWindow,
+                        """
+                        Warning: Allocation type resolution only happens on window launch.
+                        Thus if you manually lookup symbols in this view you will get method
+                        names of allocations sites, but to get the type name associated the
+                        allocation site.
+
+                        You must close and reopen this window to get the allocation types.
+                        """,
+                        "May need to resolve PDBs and reopen.");
                     App.UserConfigData["WarnedAboutOsHeapAllocTypes"] = "true";
                 }
             }
+        }
+
+        protected internal override void OnStackWindowLaunch(Window parentWindow, List<int> processIDs, string sourceName)
+        {
+            // Check for RuntimeStart events for the selected processes and warn if missing
+            WarnAboutMissingTypeInfoForProcesses(parentWindow, processIDs, sourceName);
         }
 
         public override bool SupportsProcesses { get { return true; } }
@@ -7620,13 +7769,15 @@ table {
                     if (!m_notifiedAboutWin8)
                     {
                         m_notifiedAboutWin8 = true;
-                        var versionMismatchWarning = "This trace was captured on Window 8 and is being read\r\n" +
-                                                     "on and earlier OS.  If you experience any problems please\r\n" +
-                                                     "read the trace on an Windows 8 OS.";
+                        var versionMismatchWarning = """
+                            This trace was captured on Window 8 and is being read
+                            on and earlier OS.  If you experience any problems please
+                            read the trace on an Windows 8 OS.
+                            """;
                         worker.LogWriter.WriteLine(versionMismatchWarning);
-                        parentWindow.Dispatcher.BeginInvoke((Action)delegate ()
+                        parentWindow.Dispatcher.BeginInvoke(() =>
                         {
-                            MessageBox.Show(parentWindow, versionMismatchWarning, "Log File Version Mismatch", MessageBoxButton.OK);
+                            XamlMessageBox.Show(parentWindow, versionMismatchWarning, "Log File Version Mismatch", MessageBoxButton.OK);
                         });
                     }
                 }
@@ -8232,11 +8383,18 @@ table {
                 m_traceLog.CodeAddresses.UnsafePDBMatching = true;
             }
 
-            if (m_traceLog.Truncated)   // Warn about truncation.  
+            if (m_traceLog.Truncated)   // Warn about truncation.
             {
-                GuiApp.MainWindow.Dispatcher.BeginInvoke((Action)delegate ()
+                GuiApp.MainWindow.Dispatcher.BeginInvoke(() =>
                 {
-                    MessageBox.Show("The ETL file was too big to convert and was truncated.\r\nSee log for details", "Log File Truncated", MessageBoxButton.OK);
+                    XamlMessageBox.Show(
+                        """
+                        The ETL file was too big to convert and was truncated.
+                        See log for details.
+                        """,
+                        "Log File Truncated",
+                        MessageBoxButton.OK);
+                        
                 });
             }
             return m_traceLog;
@@ -8262,9 +8420,9 @@ table {
             }
 
             MessageBoxResult result = MessageBoxResult.None;
-            parentWindow.Dispatcher.BeginInvoke((Action)delegate ()
+            parentWindow.Dispatcher.BeginInvoke(() =>
             {
-                result = MessageBox.Show(parentWindow, warning, "Lost Events", MessageBoxButton.OKCancel);
+                result = XamlMessageBox.Show(parentWindow, warning, "Lost Events", MessageBoxButton.OKCancel);
                 worker.LogWriter.WriteLine(warning);
                 if (result != MessageBoxResult.OK)
                 {
@@ -9381,7 +9539,14 @@ table {
             {
                 GuiApp.MainWindow.Dispatcher.BeginInvoke((Action)delegate ()
                 {
-                    MessageBox.Show("The ETL file was too big to convert and was truncated.\r\nSee log for details", "Log File Truncated", MessageBoxButton.OK);
+                    XamlMessageBox.Show(
+                        """
+                        The ETL file was too big to convert and was truncated.
+                        See log for details.
+                        """,
+                        "Log File Truncated",
+                        MessageBoxButton.OK);
+                        
                 });
             }
             return m_traceLog;
@@ -9402,6 +9567,30 @@ table {
         public override string[] FileExtensions => new string[] { ".netperf", ".netperf.zip", ".nettrace" };
 
         private string m_extraTopStats;
+
+        public override bool SupportsProcesses => m_supportsProcesses;
+
+        private bool m_supportsProcesses;
+        private bool m_hasUniversal;
+
+        public override List<IProcess> GetProcesses(TextWriter log)
+        {
+            var eventLog = GetTraceLog(log);
+            var processes = new List<IProcess>(eventLog.Processes.Count);
+            foreach (var process in eventLog.Processes)
+            {
+                var iprocess = new IProcessForStackSource(process.Name);
+                iprocess.StartTime = process.StartTime;
+                iprocess.EndTime = process.EndTime;
+                iprocess.CPUTimeMSec = process.CPUMSec;
+                iprocess.ParentID = process.ParentID;
+                iprocess.CommandLine = process.CommandLine;
+                iprocess.ProcessID = process.ProcessID;
+                processes.Add(iprocess);
+            }
+            processes.Sort();
+            return processes;
+        }
 
         protected internal override EventSource OpenEventSourceImpl(TextWriter log)
         {
@@ -9433,6 +9622,10 @@ table {
             bool hasAspNetCoreHosting = false;
             bool hasContention = false;
             bool hasWaitHandle = false;
+            bool hasExceptions = false;
+            bool hasUniversalSystem = false;
+            bool hasUniversalCPU = false;
+            bool hasUniversalCSwitch = false;
             if (m_traceLog != null)
             {
                 foreach (TraceEventCounts eventStats in m_traceLog.Stats)
@@ -9486,6 +9679,26 @@ table {
                     {
                         hasWaitHandle = true;
                     }
+                    else if (eventStats.EventName.StartsWith("Exception/Start"))
+                    {
+                        hasExceptions = true;
+                    }
+                    else if (eventStats.ProviderGuid == UniversalSystemTraceEventParser.ProviderGuid)
+                    {
+                        m_hasUniversal = true;
+                        hasUniversalSystem = true;
+                        m_supportsProcesses = true;
+                    }
+                    else if (eventStats.ProviderGuid == UniversalEventsTraceEventParser.ProviderGuid && eventStats.EventName.StartsWith("cpu"))
+                    {
+                        hasUniversalCPU = true;
+                        m_supportsProcesses = true;
+                    }
+                    else if (eventStats.ProviderGuid == UniversalEventsTraceEventParser.ProviderGuid && eventStats.EventName.StartsWith("cswitch"))
+                    {
+                        hasUniversalCSwitch = true;
+                        m_supportsProcesses = true;
+                    }
                 }
             }
 
@@ -9495,18 +9708,41 @@ table {
 
             if (m_traceLog != null)
             {
+                if (hasUniversalSystem) // universal
+                {
+                    m_Children.Add(new PerfViewProcesses(this));
+
+                    if (hasUniversalCPU)
+                    {
+                        m_Children.Add(new PerfViewStackSource(this, "CPU"));
+                    }
+
+                    if (hasUniversalCSwitch)
+                    {
+                        m_Children.Add(new PerfViewStackSource(this, "Thread Time"));
+                    }
+                }
+                else // dotnet-trace
+                {
+                    if (hasAnyStacks)
+                    {
+                        m_Children.Add(new PerfViewStackSource(this, "Thread Time (with StartStop Activities)"));
+                    }
+                }
+
+                // Source agnostic
                 m_Children.Add(new PerfViewEventSource(this));
-                m_Children.Add(new PerfViewEventStats(this));
+                advanced.AddChild(new PerfViewEventStats(this));
 
                 if (hasAnyStacks)
                 {
-                    m_Children.Add(new PerfViewStackSource(this, "Thread Time (with StartStop Activities)"));
-                    m_Children.Add(new PerfViewStackSource(this, "Any"));
+                    advanced.AddChild(new PerfViewStackSource(this, "Any"));
                 }
 
                 if (hasGC)
                 {
                     memory.AddChild(new PerfViewGCStats(this));
+                    memory.AddChild(new MemoryAnalyzer(this));
                 }
 
                 if (hasGCAllocationTicks)
@@ -9551,6 +9787,11 @@ table {
                 if (hasWaitHandle)
                 {
                     advanced.AddChild(new PerfViewStackSource(this, "WaitHandleWait"));
+                }
+
+                if (hasExceptions)
+                {
+                    advanced.AddChild(new PerfViewStackSource(this, "Exceptions"));
                 }
             }
 
@@ -9752,6 +9993,31 @@ table {
 
                         return stackSource;
                     }
+                case "CPU":
+                    {
+                        var eventLog = GetTraceLog(log);
+                        var eventSource = eventLog.Events.GetSource();
+                        var stackSource = new MutableTraceEventStackSource(eventLog);
+                        var sample = new StackSourceSample(stackSource);
+
+                        var universalEventsParser = new UniversalEventsTraceEventParser(eventSource);
+                        universalEventsParser.cpu += delegate (SampleTraceData data)
+                        {
+                            sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
+                            sample.Metric = data.Value;
+                            sample.StackIndex = stackSource.GetCallStack(data.CallStackIndex(), data);
+                            stackSource.AddSample(sample);
+                            
+                        };
+                        eventSource.Process();
+
+                        return stackSource;
+                    }
+                case "Thread Time":
+                    {
+                        var eventLog = GetTraceLog(log);
+                        return eventLog.ThreadTimeStacks();
+                    }
                 default:
                     {
                         var eventLog = GetTraceLog(log);
@@ -9893,6 +10159,43 @@ table {
 
                         return stackSource;
                     }
+                case "Exceptions":
+                    {
+                        var eventLog = GetTraceLog(log);
+
+                        var stackSource = new MutableTraceEventStackSource(eventLog);
+                        // EventPipe currently only has managed code stacks.
+                        stackSource.OnlyManagedCodeStacks = !m_supportsProcesses;
+                        stackSource.ShowUnknownAddresses = App.CommandLineArgs.ShowUnknownAddresses;
+                        stackSource.ShowOptimizationTiers = App.CommandLineArgs.ShowOptimizationTiers;
+
+                        TraceEvents events = eventLog.Events;
+
+                        if (startRelativeMSec != 0 || endRelativeMSec != double.PositiveInfinity)
+                        {
+                            events = events.FilterByTime(startRelativeMSec, endRelativeMSec);
+                        }
+
+                        var eventSource = events.GetSource();
+                        var sample = new StackSourceSample(stackSource);
+
+                        eventSource.Clr.ExceptionStart += delegate (ExceptionTraceData data)
+                        {
+                            sample.Metric = 1;
+                            sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
+
+                            // Create a call stack that ends with the 'throw'
+                            var nodeName = "Throw(" + data.ExceptionType + ") " + data.ExceptionMessage;
+                            var nodeIndex = stackSource.Interner.FrameIntern(nodeName);
+                            sample.StackIndex = stackSource.Interner.CallStackIntern(nodeIndex, stackSource.GetCallStack(data.CallStackIndex(), data));
+                            stackSource.AddSample(sample);
+                        };
+
+                        eventSource.Process();
+                        stackSource.DoneAddingSamples();
+
+                        return stackSource;
+                    }
             }
         }
 
@@ -9910,7 +10213,7 @@ table {
                 stackWindow.ExcludeRegExTextBox.Text = excludePat;
             }
 
-            if (stackSourceName.Contains("Thread Time"))
+            if (!m_hasUniversal && stackSourceName.Contains("Thread Time"))
             {
                 stackWindow.ScalingPolicy = ScalingPolicyKind.TimeMetric;
                 stackWindow.FoldRegExTextBox.Text += ";UNMANAGED_CODE_TIME;CPU";
@@ -10039,7 +10342,14 @@ table {
             {
                 GuiApp.MainWindow.Dispatcher.BeginInvoke((Action)delegate ()
                 {
-                    MessageBox.Show("The ETL file was too big to convert and was truncated.\r\nSee log for details", "Log File Truncated", MessageBoxButton.OK);
+                    MessageBox.Show(
+                        """
+                        The ETL file was too big to convert and was truncated.
+                        See log for details.
+                        """,
+                        "Log File Truncated",
+                        MessageBoxButton.OK);
+                        
                 });
             }
             return m_traceLog;
@@ -10081,28 +10391,79 @@ table {
 
         public TraceLog TryGetTraceLog() { return m_traceLog; }
 
+        /// <summary>
+        /// Find symbols for the simple module name 'simpleModuleName.  If 'processId' is non-zero then only search for modules loaded in that
+        /// process, otherwise look systemWide.
+        /// </summary>
+        public override void LookupSymbolsForModule(string simpleModuleName, TextWriter log, int processId = 0)
+        {
+            var symReader = GetSymbolReader(log);
+
+            // If we have a process, look the DLL up just there
+            var moduleFiles = new Dictionary<int, TraceModuleFile>();
+            if (processId != 0)
+            {
+                var process = m_traceLog.Processes.LastProcessWithID(processId);
+                if (process != null)
+                {
+                    foreach (var loadedModule in process.LoadedModules)
+                    {
+                        if (string.Compare(loadedModule.Name, simpleModuleName, StringComparison.OrdinalIgnoreCase) == 0)
+                        {
+                            moduleFiles[(int)loadedModule.ModuleFile.ModuleFileIndex] = loadedModule.ModuleFile;
+                        }
+                    }
+                }
+            }
+
+            // We did not find it, try system-wide
+            if (moduleFiles.Count == 0)
+            {
+                foreach (var moduleFile in m_traceLog.ModuleFiles)
+                {
+                    if (string.Compare(moduleFile.Name, simpleModuleName, StringComparison.OrdinalIgnoreCase) == 0)
+                    {
+                        moduleFiles[(int)moduleFile.ModuleFileIndex] = moduleFile;
+                    }
+                }
+            }
+
+            if (moduleFiles.Count == 0)
+            {
+                throw new ApplicationException("Could not find module " + simpleModuleName + " in trace.");
+            }
+
+            if (moduleFiles.Count > 1)
+            {
+                log.WriteLine("Found {0} modules with name {1}", moduleFiles.Count, simpleModuleName);
+            }
+
+            foreach (var moduleFile in moduleFiles.Values)
+            {
+                m_traceLog.CodeAddresses.LookupSymbolsForModule(symReader, moduleFile);
+            }
+        }
+
         #region Private
 
         private void HandleLostEvents(Window parentWindow, bool truncated, int numberOfLostEvents, int eventCountAtTrucation, StatusBar worker)
         {
-            string warning;
-            if (!truncated)
-            {
-                warning = "WARNING: There were " + numberOfLostEvents + " lost events in the trace.\r\n" +
-                    "Some analysis might be invalid.";
-            }
-            else
-            {
-                warning = "WARNING: The ETLX file was truncated at " + eventCountAtTrucation + " events.\r\n" +
-                    "This is to keep the ETLX file size under 4GB, however all rundown events are processed.\r\n" +
-                    "Use /SkipMSec:XXX after clearing the cache (File->Clear Temp Files) to see the later parts of the file.\r\n" +
-                    "See log for more details.";
-            }
+            string warning = !truncated
+                ? $"""
+                WARNING: There were {numberOfLostEvents} lost events in the trace.
+                Some analysis might be invalid.
+                """
+                : $"""
+                WARNING: The ETLX file was truncated at {eventCountAtTrucation} events.
+                This is to keep the ETLX file size under 4GB, however all rundown events are processed.
+                Use /SkipMSec:XXX after clearing the cache (File->Clear Temp Files) to see the later parts of the file.
+                See log for more details.
+                """;
 
             MessageBoxResult result = MessageBoxResult.None;
             parentWindow.Dispatcher.BeginInvoke((Action)delegate ()
             {
-                result = MessageBox.Show(parentWindow, warning, "Lost Events", MessageBoxButton.OKCancel);
+                result = XamlMessageBox.Show(parentWindow, warning, "Lost Events", MessageBoxButton.OKCancel);
                 worker.LogWriter.WriteLine(warning);
                 if (result != MessageBoxResult.OK)
                 {
@@ -10210,17 +10571,22 @@ table {
                 {
                     if (m_numFailures == 1 && !Path.GetFileName(module.Path).StartsWith("mrt", StringComparison.OrdinalIgnoreCase))
                     {
-                        GuiApp.MainWindow.Dispatcher.BeginInvoke((Action)delegate ()
+                        GuiApp.MainWindow.Dispatcher.BeginInvoke(() =>
                         {
-                            MessageBox.Show(GuiApp.MainWindow,
-                                "Warning: Could not find PDB for module " + Path.GetFileName(module.Path) + "\r\n" +
-                                "Some types will not have symbolic names.\r\n" +
-                                "See log for more details.\r\n" +
-                                "Fix by placing PDB on symbol path or in a directory called 'symbols' beside .gcdump file.",
+                            XamlMessageBox.Show(
+                                GuiApp.MainWindow,
+                                $"""
+                                Warning: Could not find PDB for module {Path.GetFileName(module.Path)}.
+                                Some types will not have symbolic names.
+                                See log for more details.
+                                Fix by placing PDB on symbol path or in a directory called 'symbols' beside .gcdump file.
+                                """,
                                 "PDB lookup failure");
                         });
                     }
-                    m_log.WriteLine("Failed to find PDB for module {0} to look up type 0x{1:x}", module.Path, typeID);
+
+                    m_log.WriteLine($"Failed to find PDB for module {module.Path} to look up type 0x{typeID:x}");
+
                     if (m_numFailures == 5)
                     {
                         m_log.WriteLine("Discontinuing PDB module lookup messages");

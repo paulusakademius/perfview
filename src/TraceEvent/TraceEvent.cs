@@ -873,7 +873,9 @@ namespace Microsoft.Diagnostics.Tracing
             get
             {
                 int ret = eventRecord->BufferContext.ProcessorNumber;
-                Debug.Assert(0 <= ret && ret < traceEventSource.NumberOfProcessors);
+                Debug.Assert((traceEventSource.NumberOfProcessors == 0 && ret == 0) ||
+                             (0 <= ret && ret < traceEventSource.NumberOfProcessors));
+
                 return ret;
             }
         }
@@ -1584,6 +1586,17 @@ namespace Microsoft.Diagnostics.Tracing
         }
 
         /// <summary>
+        /// Skip a UTF8 string that is prepended by its size, stored as a 2-byte unsigned integer.
+        /// </summary>
+        /// <returns>Offset just after the string</returns>
+        protected internal int SkipShortUTF8String(int offset)
+        {
+            IntPtr mofData = DataStart;
+            ushort length = (ushort)TraceEventRawReaders.ReadInt16(mofData, offset);
+            return offset + 2 + length; // + 2 for the length field
+        }
+
+        /// <summary>
         /// Skip UTF8 string starting at 'offset' bytes into the payload blob.
         /// </summary>  
         /// <returns>Offset just after the string</returns>
@@ -1650,6 +1663,22 @@ namespace Microsoft.Diagnostics.Tracing
         }
 
         /// <summary>
+        /// Skip a variable sized integer (a ULEB128 with or without ZigZag encoding for a sign bit)
+        /// </summary>
+        internal int SkipVarInt(int offset)
+        {
+            int maxOffset = Math.Min(offset + 10, EventDataLength);
+            for(int i = offset; i < maxOffset; i++)
+            {
+                if(0 == (TraceEventRawReaders.ReadByte(DataStart, i) & 0x80))
+                {
+                    return i + 1;
+                }
+            }
+            return maxOffset;
+        }
+
+        /// <summary>
         /// Trivial helper that allows you to get the Offset of a field independent of 32 vs 64 bit pointer size.
         /// </summary>
         /// <param name="offset">The Offset as it would be on a 32 bit system</param>
@@ -1668,7 +1697,7 @@ namespace Microsoft.Diagnostics.Tracing
         }
         /// <summary>
         /// Given an Offset to a null terminated ASCII string in an event blob, return the string that is
-        /// held there.   
+        /// held there.
         /// </summary>
         protected internal string GetUTF8StringAt(int offset)
         {
@@ -1682,6 +1711,24 @@ namespace Microsoft.Diagnostics.Tracing
                 return TraceEventRawReaders.ReadUTF8String(DataStart, offset, EventDataLength);
             }
         }
+
+        /// <summary>
+        /// Given an Offset to a counted UTF8 string in an event blob, return the string that is
+        /// held there.  The string length is pre-pended to the string and is stored in a ushort (unsigned 16-bytes).
+        /// </summary>
+        protected internal string GetShortUTF8StringAt(int offset)
+        {
+            if (offset >= EventDataLength)
+            {
+                Debug.Assert(false, "Read past end of string");
+                return "<<ERROR EOB>>";
+            }
+            else
+            {
+                return TraceEventRawReaders.ReadShortUTF8String(DataStart, offset, EventDataLength);
+            }
+        }
+
         /// <summary>
         /// Returns the string represented by a fixed length ASCII string starting at 'offset' of length 'charCount'
         /// </summary>
@@ -1695,14 +1742,6 @@ namespace Microsoft.Diagnostics.Tracing
                 {
                     break;
                 }
-#if DEBUG
-                // TODO review. 
-                if ((c < ' ' || c > '~') && !char.IsWhiteSpace(c))
-                {
-                    Debug.WriteLine("Warning: Found unprintable chars in string truncating to " + sb.ToString());
-                    break;
-                }
-#endif
                 sb.Append(c);
             }
             return sb.ToString();
@@ -1722,14 +1761,6 @@ namespace Microsoft.Diagnostics.Tracing
                 {
                     break;
                 }
-#if DEBUG
-                // TODO review. 
-                if ((c < ' ' || c > '~') && !char.IsWhiteSpace(c))
-                {
-                    Debug.WriteLine("Warning: Found unprintable chars in string truncating to " + sb.ToString());
-                    break;
-                }
-#endif
                 sb.Append(c);
             }
             return sb.ToString();
@@ -1867,6 +1898,24 @@ namespace Microsoft.Diagnostics.Tracing
         protected internal double GetDoubleAt(int offset)
         {
             return TraceEventRawReaders.ReadDouble(DataStart, offset);
+        }
+
+        /// <summary>
+        /// Returns a ULEB128 that was serialized at 'offset' in the payload bytes
+        /// </summary>
+        protected internal ulong GetVarUIntAt(int offset)
+        {
+            return TraceEventRawReaders.ReadVarUInt(DataStart, offset, EventDataLength);
+        }
+
+        /// <summary>
+        /// Returns a signed variable length integer serialized at 'offset' in the payload bytes.
+        /// The value is first decoded as a ULEB128, then the LSB is extracted and treated as a sign bit.
+        /// This often referred to as ZigZag encoding.
+        /// </summary>
+        protected internal long GetVarIntAt(int offset)
+        {
+            return TraceEventRawReaders.ReadVarInt(DataStart, offset, EventDataLength);
         }
 
         /// <summary>
@@ -2833,7 +2882,12 @@ namespace Microsoft.Diagnostics.Tracing
             }
 
 #if DEBUG
-            if (GetProviderName() != null && !m_ConfirmedAllEventsAreInEnumeration)
+            // ApplicationServerTraceEventParser is auto-generated and has many events sharing the same
+            // task name, producing duplicate computed event names that ConfirmAllEventsAreInEnumeration
+            // cannot handle.
+            if (GetProviderName() != null && !m_ConfirmedAllEventsAreInEnumeration &&
+                !(this is PredefinedDynamicTraceEventParser) &&
+                !(this is Parsers.ApplicationServerTraceEventParser))
             {
                 ConfirmAllEventsAreInEnumeration();
                 m_ConfirmedAllEventsAreInEnumeration = true;
@@ -3083,7 +3137,7 @@ namespace Microsoft.Diagnostics.Tracing
         internal virtual EventFilterResponse OnNewEventDefintion(TraceEvent template, bool mayHaveExistedBefore)
         {
 #if !NOT_WINDOWS && !NO_DYNAMIC_TRACEEVENTPARSER
-            Debug.Assert(template is DynamicTraceEventData);
+            Debug.Assert(template is DynamicTraceEventData || template is PredefinedDynamicEvent);
 #endif
             EventFilterResponse combinedResponse = EventFilterResponse.RejectProvider;      // This is the combined result from all subscriptions. 
             var templateState = StateObject;
@@ -3092,7 +3146,6 @@ namespace Microsoft.Diagnostics.Tracing
             {
                 var cur = m_subscriptionRequests[i];
                 // TODO sort template by provider so we can optimize.  
-                Debug.Assert(GetProviderName() == null);         // Static parsers (providerName != null) don't support OnNewEventDefintion. 
                 if (cur.m_eventToObserve != null)
                 {
                     var response = cur.m_eventToObserve(template.ProviderName, template.EventName);
@@ -4563,6 +4616,34 @@ namespace Microsoft.Diagnostics.Tracing
         {
             return *((byte*)((byte*)pointer.ToPointer() + offset));
         }
+        internal static unsafe ulong ReadVarUInt(IntPtr pointer, int offset, int bufferLength)
+        {
+            Span<byte> bytes = new Span<byte>(pointer.ToPointer(), bufferLength);
+            int maxOffset = Math.Min(offset + 10, bufferLength);
+            ulong val = 0;
+            int shift = 0;
+            byte b;
+            do
+            {
+                if(offset == maxOffset)
+                {
+                    throw new FormatException("Invalid VarUInt");
+                }
+                b = bytes[offset];
+                offset++;
+                val |= (ulong)(b & 0x7f) << shift;
+                shift += 7;
+            } while ((b & 0x80) != 0);
+            return val;
+        }
+
+        internal static unsafe long ReadVarInt(IntPtr pointer, int offset, int bufferLength)
+        {
+            ulong val = ReadVarUInt(pointer, offset, bufferLength);
+            return (val & 0x1) == 0 ? (long)(val >> 1) : (long)~(val >> 1);
+        }
+
+
         internal static unsafe string ReadUnicodeString(IntPtr pointer, int offset, int bufferLength)
         {
             // Really we should be able to count on pointers being null terminated.  However we have had instances
@@ -4604,6 +4685,29 @@ namespace Microsoft.Diagnostics.Tracing
                 buff[i++] = c;
             }
             return Encoding.UTF8.GetString(buff, 0, i);     // Convert to unicode.  
+        }
+
+        internal static unsafe string ReadShortUTF8String(IntPtr pointer, int offset, int bufferLength)
+        {
+            // Read the length of the string
+            ushort length = (ushort)ReadInt16(pointer, offset);
+            if (length == 0)
+            {
+                return string.Empty;
+            }
+            if (length > bufferLength - sizeof(ushort))
+            {
+                throw new FormatException("Invalid UTF8 String");
+            }
+            var buff = new byte[length];
+            byte* ptr = ((byte*)pointer) + offset + sizeof(ushort);
+            ushort i = 0;
+            while (i < length)
+            {
+                byte c = ptr[i];
+                buff[i++] = c;
+            }
+            return Encoding.UTF8.GetString(buff, 0, i);     // Convert to unicode.
         }
     }
 

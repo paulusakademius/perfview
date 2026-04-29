@@ -25,8 +25,8 @@ namespace PerfView.GuiUtilities
         /// </summary>
         public bool HideOnClose;
 
-        public bool CanGoForward { get { return Browser.CanGoForward; } }
-        public bool CanGoBack { get { return Browser.CanGoBack; } }
+        public bool CanGoForward { get { return _disposed ? false : Browser.CanGoForward; } }
+        public bool CanGoBack { get { return _disposed ? false : Browser.CanGoBack; } }
         public WebView2 Browser { get { return _Browser; } }
 
         public static readonly DependencyProperty SourceProperty = DependencyProperty.Register(
@@ -52,16 +52,17 @@ namespace PerfView.GuiUtilities
         /// </summary>
         private void Navigate()
         {
-            if (Source != null && _Browser.CoreWebView2 != null)
+            if (!_disposed && Source?.ToString() is { } source)
             {
-                _Browser.CoreWebView2.Navigate(Source.ToString());
+                Browser?.CoreWebView2.Navigate(source);
             }
         }
 
         #region private
+        private bool _disposed = false;
         private void BackClick(object sender, RoutedEventArgs e)
         {
-            if (Browser.CanGoBack)
+            if (CanGoBack)
             {
                 Browser.GoBack();
             }
@@ -69,7 +70,7 @@ namespace PerfView.GuiUtilities
 
         private void ForwardClick(object sender, RoutedEventArgs e)
         {
-            if (Browser.CanGoForward)
+            if (CanGoForward)
             {
                 Browser.GoForward();
             }
@@ -85,6 +86,15 @@ namespace PerfView.GuiUtilities
                 Hide();
                 e.Cancel = true;
             }
+            else
+            {
+                // Dispose WebView2 to prevent finalizer crashes
+                if (!_disposed)
+                {
+                    Browser?.Dispose();
+                    _disposed = true;
+                }
+            }
         }
 
         /// <summary>
@@ -92,8 +102,14 @@ namespace PerfView.GuiUtilities
         /// </summary>
         private void Browser_Loaded(object sender, RoutedEventArgs e)
         {
+            if (_disposed)
+            {
+                return;
+            }
+
             var userDataFolder = Path.Combine(SupportFiles.SupportFileDir, "WebView2");
             Directory.CreateDirectory(userDataFolder);
+
             var environmentAwaiter = CoreWebView2Environment
                 .CreateAsync(userDataFolder: userDataFolder)
                 .ConfigureAwait(true)
@@ -101,13 +117,24 @@ namespace PerfView.GuiUtilities
 
             environmentAwaiter.OnCompleted(async () =>
             {
+                if (_disposed)
+                {
+                    return;
+                }
+
                 var environment = environmentAwaiter.GetResult();
-                await _Browser.EnsureCoreWebView2Async(environment).ConfigureAwait(true);
+                await Browser.EnsureCoreWebView2Async(environment).ConfigureAwait(true);
+
+                // Set the preferred color scheme directly on the profile
+                Browser.CoreWebView2.Profile.PreferredColorScheme = GuiApp.MainWindow.ThemeViewModel.IsLightTheme
+                    ? CoreWebView2PreferredColorScheme.Light
+                    : CoreWebView2PreferredColorScheme.Dark;
 
                 // Navigate to the current specified source
                 Navigate();
             });
         }
+
         #endregion
     }
 }

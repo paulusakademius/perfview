@@ -119,11 +119,22 @@ namespace Microsoft.Diagnostics.Symbols
                 Guid hashAlgorithmGuid = metaData.GetGuid(sourceFileDocument.HashAlgorithm);
                 if (hashAlgorithmGuid == HashAlgorithmSha1)
                 {
-                    _hashAlgorithm = System.Security.Cryptography.SHA1.Create(); // lgtm [cs/weak-crypto]
+                    // CodeQL [SM02196] The PDB specifies the checksum algorithm.  This is not controlled by TraceEvent.
+                    // CodeQL [SM03938] The PDB specifies the checksum algorithm.  This is not controlled by TraceEvent.
+                    // CodeQL [SM03939] The PDB specifies the checksum algorithm.  This is not controlled by TraceEvent.
+                    _hashAlgorithm = System.Security.Cryptography.SHA1.Create();
                 }
                 else if (hashAlgorithmGuid == HashAlgorithmSha256)
                 {
                     _hashAlgorithm = System.Security.Cryptography.SHA256.Create();
+                }
+                else if (hashAlgorithmGuid == HashAlgorithmSha384)
+                {
+                    _hashAlgorithm = System.Security.Cryptography.SHA384.Create();
+                }
+                else if (hashAlgorithmGuid == HashAlgorithmSha512)
+                {
+                    _hashAlgorithm = System.Security.Cryptography.SHA512.Create();
                 }
 
                 if (_hashAlgorithm != null)
@@ -138,6 +149,8 @@ namespace Microsoft.Diagnostics.Symbols
             #region private 
             private static readonly Guid HashAlgorithmSha1 = Guid.Parse("ff1816ec-aa5e-4d10-87f7-6f4963833460");
             private static readonly Guid HashAlgorithmSha256 = Guid.Parse("8829d00f-11b8-4213-878b-770e8597ac16");
+            private static readonly Guid HashAlgorithmSha384 = Guid.Parse("d99cfeb1-8c43-444a-8a6c-b61269d2a0bf");
+            private static readonly Guid HashAlgorithmSha512 = Guid.Parse("ef2d1afc-6550-46d6-b14b-d70afe9a5566");
             #endregion
         }   // Class PortablePdbSourceFile
 

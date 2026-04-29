@@ -1116,6 +1116,22 @@ namespace Microsoft.Diagnostics.Tracing.Session
                     asArray[6] = (byte)(longVal >> 48);
                     asArray[7] = (byte)(longVal >> 56);
                 }
+                // Query existing keywords and merge them with requested keywords before capture state
+                ulong mergedKeywords = matchAnyKeywords;
+                TraceEventLevel levelToUse = TraceEventLevel.Verbose;
+                EnabledProviderInfo? existingInfo = GetEnabledInfoForProviderAndSession(&providerGuid, (ulong)m_SessionId);
+                if (existingInfo.HasValue)
+                {
+                    mergedKeywords |= existingInfo.Value.MatchAnyKeywords;
+                    levelToUse = existingInfo.Value.Level;
+                }
+
+                // Enable the provider with merged keywords first
+                int enableHr = TraceEventNativeMethods.EnableTraceEx2(
+                    m_SessionHandle, providerGuid, TraceEventNativeMethods.EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                    levelToUse, mergedKeywords, 0, EnableProviderTimeoutMSec, parameters);
+                Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(enableHr));
+
                 fixed (byte* filterDataPtr = asArray)
                 {
                     if (asArray != null)
@@ -1125,9 +1141,10 @@ namespace Microsoft.Diagnostics.Tracing.Session
                         filter.Size = asArray.Length;
                         filter.Ptr = filterDataPtr;
                     }
+
                     int hr = TraceEventNativeMethods.EnableTraceEx2(
                         m_SessionHandle, providerGuid, TraceEventNativeMethods.EVENT_CONTROL_CODE_CAPTURE_STATE,
-                        TraceEventLevel.Verbose, matchAnyKeywords, 0, EnableProviderTimeoutMSec, parameters);
+                        TraceEventLevel.Verbose, mergedKeywords, 0, EnableProviderTimeoutMSec, parameters);
                     Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
                 }
             }
@@ -1513,33 +1530,67 @@ namespace Microsoft.Diagnostics.Tracing.Session
                                    sizeof(char) * TraceEventSession.MaxNameSize;      // For session name
 
             List<string> activeTraceNames = null;
-
-            // Allocate the sessionsArray on the heap for environments that have a large number of sessions.
-            byte[] sessionsArr = new byte[MAX_SESSIONS * sizeOfProperties];
-            fixed (byte* sessionsArray = sessionsArr)
+            int sessionCount = 0;
+            int numSessions = MAX_SESSIONS;
+            int hr;
+            byte[] sessionsArr = null;
+            int previousSessionCount = 0;
+            
+            // Query in a loop until we succeed or get a non-recoverable error
+            do
             {
-                TraceEventNativeMethods.EVENT_TRACE_PROPERTIES** propetiesArray = stackalloc TraceEventNativeMethods.EVENT_TRACE_PROPERTIES*[MAX_SESSIONS];
-
-                for (int i = 0; i < MAX_SESSIONS; i++)
+                // Allocate buffer for the number of sessions we expect
+                sessionsArr = new byte[numSessions * sizeOfProperties];
+                
+                fixed (byte* sessionsArray = sessionsArr)
                 {
-                    TraceEventNativeMethods.EVENT_TRACE_PROPERTIES* properties = (TraceEventNativeMethods.EVENT_TRACE_PROPERTIES*)&sessionsArray[sizeOfProperties * i];
-                    properties->Wnode.BufferSize = (uint)sizeOfProperties;
-                    properties->LoggerNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES);
-                    properties->LogFileNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES) + sizeof(char) * TraceEventSession.MaxNameSize;
-                    propetiesArray[i] = properties;
-                }
-                int sessionCount = 0;
-                int hr = TraceEventNativeMethods.QueryAllTraces((IntPtr)propetiesArray, MAX_SESSIONS, ref sessionCount);
-                Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
+                    TraceEventNativeMethods.EVENT_TRACE_PROPERTIES** propertiesArray = stackalloc TraceEventNativeMethods.EVENT_TRACE_PROPERTIES*[numSessions];
 
-                activeTraceNames = new List<string>(sessionCount);
-                for (int i = 0; i < sessionCount; i++)
-                {
-                    byte* propertiesBlob = (byte*)propetiesArray[i];
-                    string sessionName = new string((char*)(&propertiesBlob[propetiesArray[i]->LoggerNameOffset]));
-                    activeTraceNames.Add(sessionName);
+                    // Initialize each property entry in the buffer
+                    for (int i = 0; i < numSessions; i++)
+                    {
+                        TraceEventNativeMethods.EVENT_TRACE_PROPERTIES* properties = (TraceEventNativeMethods.EVENT_TRACE_PROPERTIES*)&sessionsArray[sizeOfProperties * i];
+                        properties->Wnode.BufferSize = (uint)sizeOfProperties;
+                        properties->LoggerNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES);
+                        properties->LogFileNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES) + sizeof(char) * TraceEventSession.MaxNameSize;
+                        propertiesArray[i] = properties;
+                    }
+                    
+                    // Try to get all active sessions
+                    hr = TraceEventNativeMethods.QueryAllTraces((IntPtr)propertiesArray, numSessions, ref sessionCount);
+                    
+                    // If we succeeded, extract the session names
+                    if (hr == 0)
+                    {
+                        activeTraceNames = new List<string>(sessionCount);
+                        for (int i = 0; i < sessionCount; i++)
+                        {
+                            byte* propertiesBlob = (byte*)propertiesArray[i];
+                            string sessionName = new string((char*)(&propertiesBlob[propertiesArray[i]->LoggerNameOffset]));
+                            activeTraceNames.Add(sessionName);
+                        }
+                    }
+                    // If there are more sessions than our buffer can hold, update the buffer size and try again
+                    else if (hr == TraceEventNativeMethods.ERROR_MORE_DATA)
+                    {
+                        // If sessionCount doesn't change between iterations, throw the exception rather than looping again
+                        if (sessionCount == previousSessionCount)
+                        {
+                            Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
+                        }
+                        
+                        previousSessionCount = sessionCount;
+                        numSessions = sessionCount; // sessionCount is updated by QueryAllTraces with the actual count
+                    }
+                    else
+                    {
+                        // For any other error, throw the exception
+                        Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
+                    }
                 }
             }
+            while (hr == TraceEventNativeMethods.ERROR_MORE_DATA);
+            
             return activeTraceNames;
         }
 
@@ -1709,27 +1760,47 @@ namespace Microsoft.Diagnostics.Tracing.Session
                         {
                             SortedDictionary<string, Guid> providersByName = new SortedDictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
                             int buffSize = 0;
-                            var hr = TraceEventNativeMethods.TdhEnumerateProviders(null, ref buffSize);
-                            Debug.Assert(hr == 122);     // ERROR_INSUFFICIENT_BUFFER
-                            var buffer = stackalloc byte[buffSize];
-                            var providersDesc = (TraceEventNativeMethods.PROVIDER_ENUMERATION_INFO*)buffer;
+                            byte[] buffer = null;
+                            int hr;
 
-                            hr = TraceEventNativeMethods.TdhEnumerateProviders(providersDesc, ref buffSize);
-                            if ((hr == 0) && (providersDesc != null))
+                            // Retry loop to handle the case where the buffer size changes between calls
+                            // This can happen if providers are registered/unregistered between the two calls
+                            for (; ; )
                             {
-                                var providers = (TraceEventNativeMethods.TRACE_PROVIDER_INFO*)&providersDesc[1];
-                                for (int i = 0; i < providersDesc->NumberOfProviders; i++)
+                                if (buffSize > 0)
                                 {
-                                    var name = new string((char*)&buffer[providers[i].ProviderNameOffset]);
-                                    providersByName[name] = providers[i].ProviderGuid;
+                                    buffer = new byte[buffSize];
                                 }
 
-                                s_providersByName = providersByName;
+                                fixed (byte* bufferPtr = buffer)
+                                {
+                                    var providersDesc = (TraceEventNativeMethods.PROVIDER_ENUMERATION_INFO*)bufferPtr;
+
+                                    hr = TraceEventNativeMethods.TdhEnumerateProviders(providersDesc, ref buffSize);
+                                    if (hr == 0)
+                                    {
+                                        if (providersDesc != null)
+                                        {
+                                            var providers = (TraceEventNativeMethods.TRACE_PROVIDER_INFO*)&providersDesc[1];
+                                            for (int i = 0; i < providersDesc->NumberOfProviders; i++)
+                                            {
+                                                var name = new string((char*)&bufferPtr[providers[i].ProviderNameOffset]);
+                                                providersByName[name] = providers[i].ProviderGuid;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+
+                                // Error 122 means buffer not big enough. For that error we retry, everything else simply fail.
+                                if (hr != 122)
+                                {
+                                    throw new Exception("Failed to enumerate trace providers. TdhEnumerateProviders failed HR = " + hr);
+                                }
                             }
-                            else
-                            {
-                                Trace.WriteLine("TdhEnumerateProviders failed HR = " + hr);
-                            }
+
+                            // Always assign providersByName to avoid NullReferenceException on subsequent lookups
+                            s_providersByName = providersByName;
                         }
                     }
                 }
@@ -2520,17 +2591,23 @@ namespace Microsoft.Diagnostics.Tracing.Session
             for (int i = 0; &providerGuids[i] < bufferEnd; i++)
             {
                 Guid* providerId = &providerGuids[i];
-                long? matchAnyKeyword = GetEnabledKeywordsForProviderAndSession(providerId, sessionId);
-                if (matchAnyKeyword != null)
+                EnabledProviderInfo? enabledInfo = GetEnabledInfoForProviderAndSession(providerId, sessionId);
+                if (enabledInfo != null)
                 {
-                    ret.Add(*providerId, (ulong)matchAnyKeyword);
+                    ret.Add(*providerId, enabledInfo.Value.MatchAnyKeywords);
                 }
             }
 
             return ret;
         }
 
-        private static unsafe long? GetEnabledKeywordsForProviderAndSession(Guid *providerId, ulong sessionId)
+        private struct EnabledProviderInfo
+        {
+            public ulong MatchAnyKeywords;
+            public TraceEventLevel Level;
+        }
+
+        private static unsafe EnabledProviderInfo? GetEnabledInfoForProviderAndSession(Guid *providerId, ulong sessionId)
         {
             int buffSize = 256;     // An initial guess that probably works most of the time.
             byte* buffer;
@@ -2551,7 +2628,7 @@ namespace Microsoft.Diagnostics.Tracing.Session
                 }
             }
 
-            long? matchAnyKeyword = null;
+            EnabledProviderInfo? result = null;
 
             TraceEventNativeMethods.TRACE_GUID_INFO* guidInfo = (TraceEventNativeMethods.TRACE_GUID_INFO*)buffer;
             byte *pCurrent = buffer + sizeof(TraceEventNativeMethods.TRACE_GUID_INFO);
@@ -2564,20 +2641,31 @@ namespace Microsoft.Diagnostics.Tracing.Session
                     TraceEventNativeMethods.TRACE_ENABLE_INFO* pEnableInfo = &((TraceEventNativeMethods.TRACE_ENABLE_INFO*)pCurrent)[j];
                     if (pEnableInfo->LoggerId == sessionId)
                     {
-                        if (matchAnyKeyword == null)
+                        if (result == null)
                         {
-                            matchAnyKeyword = pEnableInfo->MatchAnyKeyword;
+                            result = new EnabledProviderInfo
+                            {
+                                MatchAnyKeywords = (ulong)pEnableInfo->MatchAnyKeyword,
+                                Level = (TraceEventLevel)pEnableInfo->Level
+                            };
                         }
                         else
                         {
-                            matchAnyKeyword |= pEnableInfo->MatchAnyKeyword;
+                            var current = result.Value;
+                            current.MatchAnyKeywords |= (ulong)pEnableInfo->MatchAnyKeyword;
+                            // Use the higher (more verbose) level
+                            if (pEnableInfo->Level > (byte)current.Level)
+                            {
+                                current.Level = (TraceEventLevel)pEnableInfo->Level;
+                            }
+                            result = current;
                         }
                     }
                 }
                 pCurrent += sizeof(TraceEventNativeMethods.TRACE_ENABLE_INFO) * pInstanceInfo->EnableCount;
             }
 
-            return matchAnyKeyword;
+            return result;
         }
 
         private static unsafe void CopyStringToPtr(char* toPtr, string str)
@@ -2985,7 +3073,10 @@ namespace Microsoft.Diagnostics.Tracing.Session
             }
 
             // Compute the Sha1 hash
-            var sha1 = System.Security.Cryptography.SHA1.Create(); // lgtm [cs/weak-crypto]
+            // CodeQL [SM02196] The EventSource name to GUID protocol requires a SHA1 hash.
+            // CodeQL [SM03938] The EventSource name to GUID protocol requires a SHA1 hash.
+            // CodeQL [SM03939] The EventSource name to GUID protocol requires a SHA1 hash.
+            var sha1 = System.Security.Cryptography.SHA1.Create();
             byte[] hash = sha1.ComputeHash(bytes);
 
             // Create a GUID out of the first 16 bytes of the hash (SHA-1 create a 20 byte hash)
@@ -3054,7 +3145,7 @@ namespace Microsoft.Diagnostics.Tracing.Session
         /// Returns the GUID of all event provider that either has registered itself in a running process (that is
         /// it CAN be enabled) or that a session has enabled (even if no instances of the provider exist in any process).
         /// <para>
-        /// This is a relatively small list (less than 1000), unlike GetPublishedProviders.
+        /// This list can be quite large (often 2000+ entries), potentially larger than GetPublishedProviders.
         /// </para>
         /// </summary>
         public static unsafe List<Guid> GetRegisteredOrEnabledProviders()
